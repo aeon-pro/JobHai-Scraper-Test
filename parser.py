@@ -1,6 +1,5 @@
 import re
-from urllib.parse import urljoin
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -95,6 +94,7 @@ def unique(items):
         key = value.lower()
         if not value or key in seen:
             continue
+
         seen.add(key)
         output.append(value)
 
@@ -108,12 +108,12 @@ def first_text(parent, selectors):
             text = normalise_whitespace(element.get_text(" ", strip=True))
             if text:
                 return text
+
     return ""
 
 
 def card_lines(card):
-    text = card.get_text("\n", strip=True)
-    return unique(text.splitlines())
+    return unique(card.get_text("\n", strip=True).splitlines())
 
 
 def matches_any_line(lines, predicate):
@@ -197,13 +197,6 @@ def is_compact_detail_line(line):
     )
 
 
-def find_job_link(card):
-    for anchor in card.select("a[href]"):
-        if is_job_detail_href(anchor.get("href", "")):
-            return anchor
-    return None
-
-
 def is_job_detail_href(href):
     path = urlparse(href).path
     if not path:
@@ -217,6 +210,14 @@ def is_job_detail_href(href):
         or "/job/" in path
         or re.search(r"-job-in-.+-\d+", path)
     )
+
+
+def find_job_link(card):
+    for anchor in card.select("a[href]"):
+        if is_job_detail_href(anchor.get("href", "")):
+            return anchor
+
+    return None
 
 
 def experience_from_href(href):
@@ -318,30 +319,11 @@ def query_unique(soup, selectors):
             key = id(element)
             if key in seen:
                 continue
+
             seen.add(key)
             elements.append(element)
 
     return elements
-
-
-def anchor_card_fallback(soup):
-    cards = []
-    seen = set()
-
-    for anchor in soup.select("a[href]"):
-        if not is_job_detail_href(anchor.get("href", "")):
-            continue
-        card = nearest_card_container(anchor)
-        if card is None:
-            continue
-
-        key = id(card)
-        if key in seen:
-            continue
-        seen.add(key)
-        cards.append(card)
-
-    return cards
 
 
 def nearest_card_container(anchor):
@@ -351,6 +333,28 @@ def nearest_card_container(anchor):
             return parent
 
     return anchor.find_parent(["article", "li", "section", "div"])
+
+
+def anchor_card_fallback(soup):
+    cards = []
+    seen = set()
+
+    for anchor in soup.select("a[href]"):
+        if not is_job_detail_href(anchor.get("href", "")):
+            continue
+
+        card = nearest_card_container(anchor)
+        if card is None:
+            continue
+
+        key = id(card)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        cards.append(card)
+
+    return cards
 
 
 def is_likely_job_card(card):

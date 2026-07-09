@@ -1,7 +1,13 @@
 # JobHai Jaipur Scraper
 
-Small Flask app that uses Python Playwright to fetch JobHai's Jaipur jobs page,
-parses the returned HTML, and renders the top 10 jobs in the browser.
+A small Python project that scrapes the top JobHai listings for Jaipur and
+shows them in a simple Flask webapp.
+
+## Files
+
+- `parser.py` parses JobHai listing HTML into structured job records.
+- `scraper.py` loads JobHai with Playwright and prints scraped jobs as JSON.
+- `webapp.py` serves a Flask page with a **Load Jobs** button.
 
 ## Setup
 
@@ -9,23 +15,25 @@ parses the returned HTML, and renders the top 10 jobs in the browser.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python3 -m playwright install chromium
 ```
 
-The scraper uses the `get_html()` helper in `test.py`, which launches installed
-Google Chrome through Playwright. If Chrome is not installed, run
-`python3 -m playwright install chromium` and change `channel="chrome"` in
-`test.py` to the bundled Chromium launcher.
-
-## Run
+## Run the scraper
 
 ```bash
-python3 app.py
+python3 scraper.py
+```
+
+Optional:
+
+```bash
+python3 scraper.py --limit 5
+```
+
+## Run the webapp
+
+```bash
+python3 webapp.py
 ```
 
 Open `http://127.0.0.1:5000`, then click **Load Jobs**.
-
-## Tests
-
-```bash
-python3 -m pytest -q
-```
