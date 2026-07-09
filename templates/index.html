@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JobHai Jaipur Job Scraper</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script defer src="{{ url_for('static', filename='app.js') }}"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="header-band">
+        <div>
+          <p class="eyebrow">JobHai Jaipur</p>
+          <h1>JobHai Jaipur Job Scraper</h1>
+          <p class="summary">
+            Load the current top 10 jobs from JobHai and view the details found on
+            the listing page.
+          </p>
+        </div>
+        <button id="loadJobs" class="load-button" type="button" data-endpoint="/api/jobs">
+          Load Jobs
+        </button>
+      </section>
+
+      <section class="status-row" aria-live="polite">
+        <span id="statusText">Ready to scrape.</span>
+      </section>
+
+      <section id="jobs" class="jobs-grid" aria-label="Scraped jobs"></section>
+    </main>
+  </body>
+</html>
