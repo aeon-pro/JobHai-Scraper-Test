@@ -52,17 +52,34 @@ python3 scraper.py --print-json
 By default, the script filters to full-time jobs and opens detail pages for
 the full job description.
 
+If JobHai blocks or resets the live page but you already have a saved CSV, copy
+or rewrite that data with:
+
+```bash
+python3 scraper.py --from-csv jobhai_jaipur_jobs.csv --output jobhai_jaipur_jobs.csv
+```
+
+The scraper also falls back to the saved CSV automatically when a live scrape
+fails and `jobhai_jaipur_jobs.csv` is present.
+
 ## Login state
 
-If JobHai shows extra fields after login, create a normal Playwright login state:
+Recommended terminal OTP login:
+
+```bash
+python3 scraper.py --otp-login YOUR_PHONE_NUMBER --auth-state jobhai_auth.json
+```
+
+Enter the OTP when prompted. This creates a local `jobhai_auth.json` file with
+JobHai cookies, including `access_token`, `access_id`, and `deviceId`.
+
+Alternative browser login:
 
 ```bash
 python3 scraper.py --login --auth-state jobhai_auth.json
 ```
 
-Complete login in the opened browser, then press Enter in the terminal. This
-creates a local `jobhai_auth.json` file with JobHai cookies, including
-`access_token`, `access_id`, and `deviceId`.
+Complete login in the opened browser, then press Enter in the terminal.
 
 You can confirm the auth file exists:
 
