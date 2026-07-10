@@ -52,15 +52,15 @@ python3 scraper.py --print-json
 By default, the script filters to full-time jobs and opens detail pages for
 the full job description.
 
-If JobHai blocks or resets the live page but you already have a saved CSV, copy
-or rewrite that data with:
+If you intentionally want to copy or trim an existing CSV instead of scraping
+fresh JobHai data, use:
 
 ```bash
 python3 scraper.py --from-csv jobhai_jaipur_jobs.csv --output jobhai_jaipur_jobs.csv
 ```
 
-The scraper also falls back to the saved CSV automatically when a live scrape
-fails and `jobhai_jaipur_jobs.csv` is present.
+Normal scraper runs do not reuse old CSV data. If JobHai blocks or resets the
+live page, the command exits with an error so you know fresh data was not saved.
 
 ## Login state
 
@@ -93,6 +93,10 @@ Then use it in future scraper runs:
 python3 scraper.py --auth-state jobhai_auth.json
 ```
 
+The auth state is used only for logged-in recruiter contact API calls. Listing
+and detail pages are scraped in public mode because the logged-in page can render
+a different shell that does not expose the same job cards.
+
 Do not commit or upload `jobhai_auth.json`. It contains private login tokens
 for the JobHai account. The file is already listed in `.gitignore`.
 
@@ -114,6 +118,17 @@ python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact
 This option is intentionally separate because it may send job applications or
 record call activity on the logged-in account. The script only decrypts the
 phone number when JobHai returns `call_allowed: true`.
+
+If JobHai returns an encrypted `job_contact` token but marks `call_allowed:
+false` because calling is outside the active window, use this assignment-mode
+command:
+
+```bash
+python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token
+```
+
+Use this only for your own assignment/testing account because it still uses the
+logged-in Call HR flow and may record application/call activity.
 
 ## Run the webapp
 

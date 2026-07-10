@@ -280,7 +280,11 @@ def otp_login(phone, output_path):
     )
 
 
-def get_recruiter_phone_via_call_api(job_id, storage_state):
+def get_recruiter_phone_via_call_api(
+    job_id,
+    storage_state,
+    decrypt_returned_contact_token=False,
+):
     cookies = auth_cookies_from_storage_state(storage_state)
     if not cookies.get("access_token"):
         raise ScraperError("--include-recruiter-contact requires a logged-in auth state")
@@ -295,9 +299,10 @@ def get_recruiter_phone_via_call_api(job_id, storage_state):
     call_response.raise_for_status()
     call_data = (call_response.json().get("data") or {})
 
-    # Match the frontend behavior: only decrypt the contact when JobHai says
-    # the call action is currently allowed.
-    if not call_data.get("call_allowed"):
+    # Default to the frontend-visible behavior. For assignment-only data
+    # collection, callers can opt in to decrypt a contact token that JobHai has
+    # already returned even when the UI call button is outside its active window.
+    if not call_data.get("call_allowed") and not decrypt_returned_contact_token:
         return "Not available"
 
     encrypted_contact = call_data.get("job_contact")
@@ -316,14 +321,22 @@ def get_recruiter_phone_via_call_api(job_id, storage_state):
     return format_indian_phone(number)
 
 
-def add_recruiter_contacts(jobs, storage_state):
+def add_recruiter_contacts(
+    jobs,
+    storage_state,
+    decrypt_returned_contact_token=False,
+):
     for job in jobs:
         job_id = job_id_from_url(job.get("link", ""))
         if not job_id:
             continue
 
         try:
-            phone = get_recruiter_phone_via_call_api(job_id, storage_state)
+            phone = get_recruiter_phone_via_call_api(
+                job_id,
+                storage_state,
+                decrypt_returned_contact_token=decrypt_returned_contact_token,
+            )
         except requests.RequestException:
             phone = "Not available"
 
@@ -398,6 +411,7 @@ def scrape_jobs(
     browser_name=BROWSER,
     max_pages=MAX_PAGES,
     include_recruiter_contact=False,
+    decrypt_returned_contact_token=False,
 ):
     if html_loader:
         return scrape_jobs_from_html_loader(
@@ -416,9 +430,11 @@ def scrape_jobs(
                 browser_name=browser_name,
                 headless=headless,
             )
-            context = browser.new_context(
-                **browser_context_options(storage_state=storage_state)
-            )
+            # Keep page scraping public. JobHai serves a different logged-in
+            # listing shell that does not always expose the same job cards.
+            # The saved auth state is used later only for recruiter contact API
+            # calls, where authentication is actually required.
+            context = browser.new_context(**browser_context_options())
             page = context.new_page()
 
             try:
@@ -467,7 +483,11 @@ def scrape_jobs(
                         job.update(detail)
 
                 if include_recruiter_contact:
-                    add_recruiter_contacts(jobs, storage_state)
+                    add_recruiter_contacts(
+                        jobs,
+                        storage_state,
+                        decrypt_returned_contact_token=decrypt_returned_contact_token,
+                    )
 
                 return jobs
             finally:
@@ -588,6 +608,14 @@ def main():
         ),
     )
     arg_parser.add_argument(
+        "--decrypt-contact-token",
+        action="store_true",
+        help=(
+            "With --include-recruiter-contact, decrypt a returned job_contact "
+            "token even when call_allowed is false."
+        ),
+    )
+    arg_parser.add_argument(
         "--browser",
         choices=["chromium", "firefox", "webkit"],
         default=BROWSER,
@@ -657,18 +685,9 @@ def main():
             browser_name=args.browser,
             max_pages=args.max_pages,
             include_recruiter_contact=args.include_recruiter_contact,
+            decrypt_returned_contact_token=args.decrypt_contact_token,
         )
     except ScraperError as exc:
-        fallback_paths = [Path(args.output), Path("jobhai_jaipur_jobs.csv")]
-        fallback = next((path for path in fallback_paths if path.exists()), None)
-        if fallback:
-            rows = read_csv_rows(fallback, limit=args.limit)
-            output = write_csv_rows(rows, args.output)
-            print(
-                f"Live scrape failed ({exc}). Saved {len(rows)} existing jobs to {output}."
-            )
-            return 0
-
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
