@@ -80,6 +80,18 @@ FIELD_SELECTORS = {
     ],
 }
 
+DESCRIPTION_SELECTORS = [
+    '[class*="jobDescription"]',
+    '[class*="JobDescription"]',
+    '[class*="description"]',
+    '[class*="Description"]',
+    '[data-testid*="description"]',
+    '[data-test*="description"]',
+]
+
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+PHONE_RE = re.compile(r"(?<![\d.])(?:\+?91[\s-]*)?[6-9](?:[\s-]*\d){9}(?![\d.])")
+
 
 def normalise_whitespace(value):
     return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
@@ -99,6 +111,13 @@ def unique(items):
         output.append(value)
 
     return output
+
+
+def clean_soup(soup):
+    for element in soup(["script", "style", "noscript"]):
+        element.decompose()
+
+    return soup
 
 
 def first_text(parent, selectors):
@@ -168,6 +187,17 @@ def is_location(line):
             re.I,
         )
     )
+
+
+def is_full_time_job(job):
+    values = [
+        job.get("jobType", ""),
+        " ".join(job.get("details", [])),
+        job.get("jobDescription", ""),
+    ]
+    text = " ".join(values).lower()
+
+    return "full time" in text or "full-time" in text
 
 
 def field_from_selectors_or_lines(card, lines, key, predicate):
@@ -369,8 +399,105 @@ def is_likely_job_card(card):
     )
 
 
-def extract_jobs(html, base_url, limit=10):
-    soup = BeautifulSoup(html, "html.parser")
+def text_from_selectors(soup, selectors):
+    for selector in selectors:
+        for element in soup.select(selector):
+            text = normalise_whitespace(element.get_text(" ", strip=True))
+            if len(text) >= 20:
+                return text
+
+    return ""
+
+
+def text_after_heading(soup, heading_patterns):
+    for element in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b"]):
+        heading = normalise_whitespace(element.get_text(" ", strip=True))
+        if not any(re.search(pattern, heading, re.I) for pattern in heading_patterns):
+            continue
+
+        parent = element.find_parent(["section", "article", "div"]) or element.parent
+        if parent:
+            text = normalise_whitespace(parent.get_text(" ", strip=True))
+            if len(text) >= 20:
+                return text
+
+    return ""
+
+
+def value_after_heading(soup, heading_patterns):
+    heading_tags = {"h1", "h2", "h3", "h4", "strong", "b"}
+
+    for element in soup.find_all(heading_tags):
+        heading = normalise_whitespace(element.get_text(" ", strip=True))
+        if not any(re.search(pattern, heading, re.I) for pattern in heading_patterns):
+            continue
+
+        values = []
+        for sibling in element.next_siblings:
+            if getattr(sibling, "name", None) in heading_tags:
+                break
+
+            text = normalise_whitespace(
+                sibling.get_text(" ", strip=True)
+                if hasattr(sibling, "get_text")
+                else sibling
+            )
+            if text:
+                values.append(text)
+
+        if values:
+            return " ".join(values)
+
+        parent = element.find_parent(["section", "article", "div"]) or element.parent
+        if parent:
+            text = normalise_whitespace(parent.get_text(" ", strip=True))
+            value = re.sub(re.escape(heading), "", text, count=1).strip(" :-")
+            if value:
+                return value
+
+    return "Not available"
+
+
+def visible_text(html):
+    soup = clean_soup(BeautifulSoup(html, "html.parser"))
+    return normalise_whitespace(soup.get_text(" ", strip=True))
+
+
+def extract_phone(text):
+    for match in PHONE_RE.finditer(text):
+        digits = re.sub(r"\D", "", match.group(0))
+        if len(digits) == 12 and digits.startswith("91"):
+            return f"+91 {digits[2:]}"
+        if len(digits) == 10 and digits[0] in "6789":
+            return f"+91 {digits}"
+
+    return "Not available"
+
+
+def extract_email(text):
+    match = EMAIL_RE.search(text)
+    return match.group(0) if match else "Not available"
+
+
+def extract_job_detail(html):
+    soup = clean_soup(BeautifulSoup(html, "html.parser"))
+    page_text = normalise_whitespace(soup.get_text(" ", strip=True))
+    description = (
+        text_from_selectors(soup, DESCRIPTION_SELECTORS)
+        or text_after_heading(soup, [r"job\s+description", r"about\s+.*job"])
+        or page_text
+    )
+
+    return {
+        "jobDescription": description,
+        "contactPerson": value_after_heading(soup, [r"contact\s+person"]),
+        "recruiterPhone": extract_phone(page_text),
+        "recruiterEmail": extract_email(page_text),
+    }
+
+
+def extract_jobs(html, base_url, limit=10, full_time_only=False):
+    soup = clean_soup(BeautifulSoup(html, "html.parser"))
     primary_cards = [
         card for card in query_unique(soup, CARD_SELECTORS) if is_likely_job_card(card)
     ]
@@ -381,6 +508,9 @@ def extract_jobs(html, base_url, limit=10):
     for card in cards:
         job = extract_job_card(card, base_url)
         if not job["title"]:
+            continue
+
+        if full_time_only and not is_full_time_job(job):
             continue
 
         key = "|".join(
