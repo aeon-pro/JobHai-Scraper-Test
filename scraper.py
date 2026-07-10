@@ -22,6 +22,7 @@ API_BASE_URL = "https://api.jobhai.com"
 WEB_BASE_URL = "https://www.jobhai.com"
 LIMIT = 10
 BROWSER = "firefox"
+FALLBACK_BROWSERS = ("firefox", "chromium", "webkit")
 MAX_PAGES = 5
 JOB_ID_RE = re.compile(r"-(\d+)-jid(?:$|[?#])")
 CSV_COLUMNS = [
@@ -79,6 +80,41 @@ def get_html(url, browser_name=BROWSER):
             return page_html(page, url)
         finally:
             browser.close()
+
+
+def browser_fallback_order(browser_name):
+    return [browser_name] + [
+        candidate for candidate in FALLBACK_BROWSERS if candidate != browser_name
+    ]
+
+
+def get_html_with_new_browser(playwright, url, browser_name=BROWSER, headless=True):
+    browser = launch_browser(playwright, browser_name=browser_name, headless=headless)
+    context = browser.new_context(**browser_context_options())
+    page = context.new_page()
+
+    try:
+        return page_html(page, url, retries=1)
+    finally:
+        browser.close()
+
+
+def resilient_page_html(playwright, page, url, browser_name=BROWSER, headless=True):
+    try:
+        return page_html(page, url)
+    except PlaywrightError as primary_error:
+        for fallback_browser in browser_fallback_order(browser_name):
+            try:
+                return get_html_with_new_browser(
+                    playwright,
+                    url,
+                    browser_name=fallback_browser,
+                    headless=headless,
+                )
+            except PlaywrightError:
+                continue
+
+        raise primary_error
 
 
 def page_html(page, url, retries=2):
@@ -435,14 +471,33 @@ def scrape_jobs(
             # The saved auth state is used later only for recruiter contact API
             # calls, where authentication is actually required.
             context = browser.new_context(**browser_context_options())
-            page = context.new_page()
 
             try:
                 jobs = []
                 seen_links = set()
                 for page_number in range(1, max_pages + 1):
                     page_url = listing_page_url(url, page_number)
-                    html = page_html(page, page_url)
+                    page = context.new_page()
+                    try:
+                        html = resilient_page_html(
+                            playwright,
+                            page,
+                            page_url,
+                            browser_name=browser_name,
+                            headless=headless,
+                        )
+                    except PlaywrightError as exc:
+                        if page_number == 1:
+                            raise
+
+                        print(
+                            f"Warning: skipped listing page {page_number}: {exc}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    finally:
+                        page.close()
+
                     page_jobs = extract_jobs(
                         html,
                         base_url=page_url,
@@ -472,14 +527,25 @@ def scrape_jobs(
                     for job in jobs:
                         detail = default_detail()
                         if job.get("link"):
+                            detail_page = context.new_page()
                             try:
                                 detail.update(
-                                    extract_job_detail(page_html(page, job["link"]))
+                                    extract_job_detail(
+                                        resilient_page_html(
+                                            playwright,
+                                            detail_page,
+                                            job["link"],
+                                            browser_name=browser_name,
+                                            headless=headless,
+                                        )
+                                    )
                                 )
                             except PlaywrightError:
                                 detail["jobDescription"] = " ".join(
                                     job.get("details", [])
                                 )
+                            finally:
+                                detail_page.close()
                         job.update(detail)
 
                 if include_recruiter_contact:

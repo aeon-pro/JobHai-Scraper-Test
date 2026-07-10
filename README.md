@@ -22,6 +22,15 @@ Firefox is the recommended Playwright backend for JobHai. In local testing,
 Chromium/Chrome returned HTTP/2 protocol errors while Firefox-based Zen loaded
 the site normally.
 
+For maximum reliability across different PCs/networks, install all Playwright
+browsers so the scraper can fall back automatically if one browser gets reset:
+
+```bash
+python3 -m playwright install firefox chromium webkit
+```
+
+On Windows, use `python` instead of `python3` if that is how Python is installed.
+
 ## Run the assignment scraper
 
 ```bash
@@ -61,6 +70,24 @@ python3 scraper.py --from-csv jobhai_jaipur_jobs.csv --output jobhai_jaipur_jobs
 
 Normal scraper runs do not reuse old CSV data. If JobHai blocks or resets the
 live page, the command exits with an error so you know fresh data was not saved.
+
+## Troubleshooting
+
+If you see `Page.goto: NS_ERROR_NET_RESET`, JobHai or the local network reset
+the browser navigation. Install all Playwright browsers and retry:
+
+```bash
+python3 -m playwright install firefox chromium webkit
+python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token --output data.csv
+```
+
+The scraper opens a fresh page for every listing/detail URL and automatically
+tries the other installed browser engines. If the same PC still fails, try a
+different network or run with a specific browser:
+
+```bash
+python3 scraper.py --browser chromium --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token --output data.csv
+```
 
 ## Login state
 
