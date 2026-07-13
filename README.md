@@ -1,13 +1,16 @@
 # JobHai Jaipur Job Scraper
 
-A small Python project that scrapes the latest JobHai listings for Jaipur,
-opens each job detail page, and saves clean structured results to CSV.
+A small Python project that collects the latest full-time JobHai listings for
+Jaipur, opens each public job page, and saves the results to CSV.
 
 ## Files
 
-- `parser.py` parses JobHai listing and detail HTML into structured job records.
-- `scraper.py` loads JobHai with Playwright and saves jobs to CSV.
-- `webapp.py` serves a Flask page with a **Load Jobs** button.
+- `scraper.py` loads public JobHai pages and writes the CSV.
+- `jobhai_session.py` owns OTP login, saved-session access, and authenticated
+  recruiter-contact requests. Ship its obfuscated build, not its source.
+- `parser.py` converts listing and detail HTML into structured job records.
+- `webapp.py` displays every CSV field in a Flask webapp.
+- `jobhai_jaipur_jobs.csv` is the generated sample output.
 
 ## Setup
 
@@ -15,32 +18,28 @@ opens each job detail page, and saves clean structured results to CSV.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python3 -m playwright install firefox
-```
-
-Firefox is the recommended Playwright backend for JobHai. In local testing,
-Chromium/Chrome returned HTTP/2 protocol errors while Firefox-based Zen loaded
-the site normally.
-
-For maximum reliability across different PCs/networks, install all Playwright
-browsers so the scraper can fall back automatically if one browser gets reset:
-
-```bash
 python3 -m playwright install firefox chromium webkit
 ```
 
-On Windows, use `python` instead of `python3` if that is how Python is installed.
+On Windows, use `python` instead of `python3` if needed. Activate the virtual
+environment with `.venv\Scripts\activate`.
 
-## Run the assignment scraper
+## Run the scraper
 
 ```bash
-python3 scraper.py
+python3 scraper.py --output jobhai_jaipur_jobs.csv
 ```
 
-This creates:
+The default run collects up to 10 full-time Jaipur jobs and opens each detail
+page for the full job description. It does not reuse old CSV data when a live
+scrape fails.
 
-```text
-jobhai_jaipur_jobs.csv
+Useful options:
+
+```bash
+python3 scraper.py --limit 5 --output data.csv
+python3 scraper.py --browser chromium --output data.csv
+python3 scraper.py --print-json
 ```
 
 The CSV columns are:
@@ -50,112 +49,107 @@ job_title, company, location, salary, job_type, experience, posted,
 job_description, contact_person, recruiter_phone, recruiter_email, job_url
 ```
 
-Useful options:
+## Contact data and privacy
+
+The normal scrape uses only public pages. To collect recruiter contact through
+the same authorized API flow as JobHai's **Call HR** button, create a session
+once:
 
 ```bash
-python3 scraper.py --limit 5
-python3 scraper.py --output jaipur_jobs.csv
-python3 scraper.py --print-json
+python3 -m jobhai_session setup
+python3 -m jobhai_session status
 ```
 
-By default, the script filters to full-time jobs and opens detail pages for
-the full job description.
+Enter the phone number and OTP for an account you are authorized to use. The
+setup command obtains the session values and stores them through the operating
+system credential store (macOS Keychain, Windows Credential Locker, or a
+configured Linux Secret Service). Do not paste credentials into a Python file,
+the README, a `.env` file, or Git. There is no token file to place manually.
 
-If you intentionally want to copy or trim an existing CSV instead of scraping
-fresh JobHai data, use:
+Then run:
 
 ```bash
-python3 scraper.py --from-csv jobhai_jaipur_jobs.csv --output jobhai_jaipur_jobs.csv
+python3 scraper.py --include-recruiter-contact --output data.csv
 ```
 
-Normal scraper runs do not reuse old CSV data. If JobHai blocks or resets the
-live page, the command exits with an error so you know fresh data was not saved.
-
-## Troubleshooting
-
-If you see `Page.goto: NS_ERROR_NET_RESET`, JobHai or the local network reset
-the browser navigation. Install all Playwright browsers and retry:
+If the saved session expires, repeat the setup command. To remove it from the
+credential store, run:
 
 ```bash
-python3 -m playwright install firefox chromium webkit
-python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token --output data.csv
+python3 -m jobhai_session clear
 ```
 
-The scraper opens a fresh page for every listing/detail URL and automatically
-tries the other installed browser engines. If the same PC still fails, try a
-different network or run with a specific browser:
+The non-obfuscated scraper only imports `SessionError` and
+`open_contact_client`. Credential names, headers, cookies, device identity,
+login endpoints, and authenticated contact requests stay inside
+`jobhai_session.py`. The actual secret values remain in the OS credential store
+and are never embedded in either source or obfuscated code. See the
+[keyring backend documentation](https://keyring.readthedocs.io/en/latest/) for
+platform details.
+
+An older `jobhai_auth.json` file is not read by this version. After the new
+setup command reports success, remove that legacy file so a plaintext session
+is not left on disk.
+
+The reverse-engineered frontend sequence is:
+
+```text
+OTP login -> POST api.jobhai.com/jobs/v3/call
+          -> POST www.jobhai.com/v1/utils/getInfo
+```
+
+The scraper follows `call_allowed` and decrypts a contact only when JobHai's
+normal logged-in flow permits it. Calling this API may register application or
+call activity, so use an account authorized for the assignment.
+
+The observed Call HR response provides a phone contact but no recruiter email
+field. Email is therefore extracted from public job-page text when present.
+Unavailable contact fields are stored as `Not available`; the scraper does not
+fabricate them.
+
+JobHai normally places recruiter phone numbers behind its logged-in **Call HR**
+workflow. An endpoint being callable from browser code does not make private
+contact data a supported public API. This project therefore does not bypass that
+access control or publish account credentials.
+
+## Build the protected auth module
+
+Use a descriptive module name so imports remain auditable. A random or
+misleading filename does not add meaningful protection. PyArmor creates an
+obfuscated replacement plus a required runtime package; distribute the whole
+generated folder and do not distribute the source `jobhai_session.py`.
+
+From the project root and with the virtual environment active:
 
 ```bash
-python3 scraper.py --browser chromium --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token --output data.csv
+python3 -m pip install pyarmor
+rm -rf protected
+pyarmor gen -O protected jobhai_session.py
+cp scraper.py parser.py webapp.py requirements.txt protected/
 ```
 
-## Login state
-
-Recommended terminal OTP login:
+The protected layout will contain the plain entry points, the obfuscated
+`jobhai_session.py`, and a generated `pyarmor_runtime_*` directory. Test the
+build from that directory so Python imports the protected copy:
 
 ```bash
-python3 scraper.py --otp-login YOUR_PHONE_NUMBER --auth-state jobhai_auth.json
+cd protected
+python3 -m jobhai_session status
+python3 scraper.py --include-recruiter-contact --output data.csv
 ```
 
-Enter the OTP when prompted. This creates a local `jobhai_auth.json` file with
-JobHai cookies, including `access_token`, `access_id`, and `deviceId`.
+For first-time setup on a target computer, run
+`python3 -m jobhai_session setup` from inside `protected`. The credential is
+placed in that computer's OS credential store, not in the distribution folder.
+Build on the same OS, CPU architecture, and Python minor version used to run the
+protected output because the generated PyArmor runtime is platform and Python
+version dependent. Refer to the
+[official PyArmor command reference](https://pyarmor.readthedocs.io/en/latest/reference/man.html)
+for additional build options.
 
-Alternative browser login:
-
-```bash
-python3 scraper.py --login --auth-state jobhai_auth.json
-```
-
-Complete login in the opened browser, then press Enter in the terminal.
-
-You can confirm the auth file exists:
-
-```bash
-ls jobhai_auth.json
-```
-
-Then use it in future scraper runs:
-
-```bash
-python3 scraper.py --auth-state jobhai_auth.json
-```
-
-The auth state is used only for logged-in recruiter contact API calls. Listing
-and detail pages are scraped in public mode because the logged-in page can render
-a different shell that does not expose the same job cards.
-
-Do not commit or upload `jobhai_auth.json`. It contains private login tokens
-for the JobHai account. The file is already listed in `.gitignore`.
-
-Recruiter phone/email are saved only when they are visible in the page text.
-If JobHai does not expose them, the CSV stores `Not available`.
-
-## Recruiter phone numbers
-
-JobHai does not expose recruiter phone numbers in the public HTML. In the
-logged-in website, the **Call HR** button calls `jobs/v3/call`, then decrypts
-the returned contact token through `www.jobhai.com/v1/utils/getInfo`.
-
-To use that same logged-in flow, run:
-
-```bash
-python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact
-```
-
-This option is intentionally separate because it may send job applications or
-record call activity on the logged-in account. The script only decrypts the
-phone number when JobHai returns `call_allowed: true`.
-
-If JobHai returns an encrypted `job_contact` token but marks `call_allowed:
-false` because calling is outside the active window, use this assignment-mode
-command:
-
-```bash
-python3 scraper.py --auth-state jobhai_auth.json --include-recruiter-contact --decrypt-contact-token
-```
-
-Use this only for your own assignment/testing account because it still uses the
-logged-in Call HR flow and may record application/call activity.
+`protected/` and `dist/` are ignored by Git. Obfuscation raises the cost of
+reading implementation details; it is not a substitute for credential storage,
+authorization checks, or secret rotation.
 
 ## Run the webapp
 
@@ -163,4 +157,18 @@ logged-in Call HR flow and may record application/call activity.
 python3 webapp.py
 ```
 
-Open `http://127.0.0.1:5000`, then click **Load Jobs**.
+Open `http://127.0.0.1:5000` and click **Load Jobs**. The app reads
+`jobhai_jaipur_jobs.csv` and displays all columns.
+
+## Troubleshooting
+
+If Playwright reports `NS_ERROR_NET_RESET`, install every browser backend and
+retry with a different one:
+
+```bash
+python3 -m playwright install firefox chromium webkit
+python3 scraper.py --browser chromium --output data.csv
+```
+
+If all browsers fail on one connection, retry from a different network. JobHai
+may reset automated browser requests at the network edge.
