@@ -55,11 +55,17 @@ Useful options:
 ```bash
 python3 scraper.py --limit 5
 python3 scraper.py --output jaipur_jobs.csv
+python3 scraper.py --chunks 4
 python3 scraper.py --print-json
 ```
 
 By default, the script filters to full-time jobs and opens detail pages for
-the full job description.
+the full job description. Listing pages, job-detail pages, and optional
+recruiter-contact requests run asynchronously in bounded batches. `--chunks`
+sets the maximum concurrent requests in each batch (default: `5`). The scraper
+waits for the whole batch, combines results in their original order, and only
+then starts the next batch. Use a smaller value if JobHai or the network rate
+limits concurrent requests.
 
 If you intentionally want to copy or trim an existing CSV instead of scraping
 fresh JobHai data, use:

@@ -1,6 +1,8 @@
+import asyncio
 import argparse
 import csv
 import getpass
+import inspect
 import json
 import re
 import sys
@@ -10,6 +12,9 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
+from playwright.async_api import Error as AsyncPlaywrightError
+from playwright.async_api import TimeoutError as AsyncPlaywrightTimeoutError
+from playwright.async_api import async_playwright
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -24,6 +29,7 @@ LIMIT = 10
 BROWSER = "firefox"
 FALLBACK_BROWSERS = ("firefox", "chromium", "webkit")
 MAX_PAGES = 5
+CHUNKS = 5
 JOB_ID_RE = re.compile(r"-(\d+)-jid(?:$|[?#])")
 CSV_COLUMNS = [
     "job_title",
@@ -134,6 +140,147 @@ def page_html(page, url, retries=2):
                 page.wait_for_timeout(1000)
 
     raise last_error
+
+
+def validate_chunks(chunks):
+    if chunks < 1:
+        raise ScraperError("chunks must be at least 1")
+    return chunks
+
+
+def positive_int(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def request_batches(items, chunks):
+    chunks = validate_chunks(chunks)
+    values = list(items)
+    for start in range(0, len(values), chunks):
+        yield values[start : start + chunks]
+
+
+async def run_in_batches(items, chunks, worker, return_exceptions=False):
+    """Run one bounded batch at a time and preserve the input result order."""
+
+    results = []
+    for batch in request_batches(items, chunks):
+        batch_results = await asyncio.gather(
+            *(worker(item) for item in batch),
+            return_exceptions=True,
+        )
+        if not return_exceptions:
+            for result in batch_results:
+                if isinstance(result, BaseException):
+                    raise result
+        results.extend(batch_results)
+    return results
+
+
+def run_async_entry(async_function, *args, **kwargs):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(async_function(*args, **kwargs))
+
+    raise ScraperError(
+        f"Use `await {async_function.__name__}(...)` inside an async application"
+    )
+
+
+async def launch_browser_async(playwright, browser_name=BROWSER, headless=True):
+    if browser_name not in {"chromium", "firefox", "webkit"}:
+        raise ScraperError("Browser must be chromium, firefox, or webkit")
+
+    return await getattr(playwright, browser_name).launch(headless=headless)
+
+
+async def page_html_async(page, url, retries=2):
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.wait_for_load_state("load", timeout=15000)
+            except AsyncPlaywrightTimeoutError:
+                pass
+            return await page.content()
+        except AsyncPlaywrightError as exc:
+            last_error = exc
+            if attempt < retries:
+                await page.wait_for_timeout(1000)
+
+    raise last_error
+
+
+async def get_html_with_new_browser_async(
+    playwright,
+    url,
+    browser_name=BROWSER,
+    headless=True,
+):
+    browser = await launch_browser_async(
+        playwright,
+        browser_name=browser_name,
+        headless=headless,
+    )
+    context = await browser.new_context(**browser_context_options())
+    page = await context.new_page()
+
+    try:
+        return await page_html_async(page, url, retries=1)
+    finally:
+        await browser.close()
+
+
+async def resilient_page_html_async(
+    playwright,
+    page,
+    url,
+    browser_name=BROWSER,
+    headless=True,
+):
+    try:
+        return await page_html_async(page, url)
+    except AsyncPlaywrightError as primary_error:
+        for fallback_browser in browser_fallback_order(browser_name):
+            try:
+                return await get_html_with_new_browser_async(
+                    playwright,
+                    url,
+                    browser_name=fallback_browser,
+                    headless=headless,
+                )
+            except AsyncPlaywrightError:
+                continue
+
+        raise primary_error
+
+
+async def load_page_html_async(
+    context,
+    playwright,
+    url,
+    browser_name=BROWSER,
+    headless=True,
+):
+    page = await context.new_page()
+    try:
+        return await resilient_page_html_async(
+            playwright,
+            page,
+            url,
+            browser_name=browser_name,
+            headless=headless,
+        )
+    finally:
+        await page.close()
 
 
 def listing_page_url(url, page_number):
@@ -325,59 +472,177 @@ def get_recruiter_phone_via_call_api(
     if not cookies.get("access_token"):
         raise ScraperError("--include-recruiter-contact requires a logged-in auth state")
 
-    session = contact_session(cookies)
-    call_response = session.post(
-        f"{API_BASE_URL}/jobs/v3/call",
-        headers=contact_headers(cookies),
-        json={"job_id": job_id},
-        timeout=30,
-    )
-    call_response.raise_for_status()
-    call_data = (call_response.json().get("data") or {})
+    with contact_session(cookies) as session:
+        call_response = session.post(
+            f"{API_BASE_URL}/jobs/v3/call",
+            headers=contact_headers(cookies),
+            json={"job_id": job_id},
+            timeout=30,
+        )
+        call_response.raise_for_status()
+        call_data = call_response.json().get("data") or {}
 
-    # Default to the frontend-visible behavior. For assignment-only data
-    # collection, callers can opt in to decrypt a contact token that JobHai has
-    # already returned even when the UI call button is outside its active window.
-    if not call_data.get("call_allowed") and not decrypt_returned_contact_token:
-        return "Not available"
+        # Default to the frontend-visible behavior. For assignment-only data
+        # collection, callers can opt in to decrypt a contact token that JobHai
+        # has already returned even when the UI call button is outside its
+        # active window.
+        if not call_data.get("call_allowed") and not decrypt_returned_contact_token:
+            return "Not available"
 
-    encrypted_contact = call_data.get("job_contact")
-    if not encrypted_contact:
-        return "Not available"
+        encrypted_contact = call_data.get("job_contact")
+        if not encrypted_contact:
+            return "Not available"
 
-    decrypt_response = session.post(
-        f"{WEB_BASE_URL}/v1/utils/getInfo",
-        headers=contact_headers(cookies),
-        json={"number": encrypted_contact},
-        timeout=30,
-    )
-    decrypt_response.raise_for_status()
-    number = (decrypt_response.json().get("data") or {}).get("number")
+        decrypt_response = session.post(
+            f"{WEB_BASE_URL}/v1/utils/getInfo",
+            headers=contact_headers(cookies),
+            json={"number": encrypted_contact},
+            timeout=30,
+        )
+        decrypt_response.raise_for_status()
+        number = (decrypt_response.json().get("data") or {}).get("number")
 
-    return format_indian_phone(number)
+        return format_indian_phone(number)
+
+
+async def add_recruiter_contacts_async(
+    jobs,
+    storage_state,
+    decrypt_returned_contact_token=False,
+    chunks=CHUNKS,
+):
+    async def fetch_contact(job):
+        job_id = job_id_from_url(job.get("link", ""))
+        if not job_id:
+            return "Not available"
+
+        try:
+            return await asyncio.to_thread(
+                get_recruiter_phone_via_call_api,
+                job_id,
+                storage_state,
+                decrypt_returned_contact_token,
+            )
+        except requests.RequestException:
+            return "Not available"
+
+    for batch in request_batches(jobs, chunks):
+        phones = await asyncio.gather(
+            *(fetch_contact(job) for job in batch),
+            return_exceptions=True,
+        )
+        for job, phone in zip(batch, phones):
+            if isinstance(phone, BaseException):
+                raise phone
+            if phone != "Not available":
+                job["recruiterPhone"] = phone
+
+    return jobs
 
 
 def add_recruiter_contacts(
     jobs,
     storage_state,
     decrypt_returned_contact_token=False,
+    chunks=CHUNKS,
 ):
-    for job in jobs:
-        job_id = job_id_from_url(job.get("link", ""))
-        if not job_id:
+    return run_async_entry(
+        add_recruiter_contacts_async,
+        jobs,
+        storage_state,
+        decrypt_returned_contact_token=decrypt_returned_contact_token,
+        chunks=chunks,
+    )
+
+
+async def call_html_loader_async(html_loader, url):
+    if inspect.iscoroutinefunction(html_loader):
+        return await html_loader(url)
+
+    result = await asyncio.to_thread(html_loader, url)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def append_unique_jobs(jobs, seen_links, page_jobs, limit):
+    for job in page_jobs:
+        key = job.get("link") or "|".join(
+            [job.get("title", ""), job.get("company", "")]
+        )
+        if key in seen_links:
             continue
 
-        try:
-            phone = get_recruiter_phone_via_call_api(
-                job_id,
-                storage_state,
-                decrypt_returned_contact_token=decrypt_returned_contact_token,
-            )
-        except requests.RequestException:
-            phone = "Not available"
+        seen_links.add(key)
+        jobs.append(job)
+        if len(jobs) >= limit:
+            break
 
-        if phone != "Not available":
-            job["recruiterPhone"] = phone
+
+async def scrape_jobs_from_html_loader_async(
+    url=TARGET_URL,
+    limit=LIMIT,
+    html_loader=get_html,
+    include_details=True,
+    full_time_only=True,
+    max_pages=MAX_PAGES,
+    chunks=CHUNKS,
+):
+    jobs = []
+    seen_links = set()
+    page_requests = [
+        (page_number, listing_page_url(url, page_number))
+        for page_number in range(1, max_pages + 1)
+    ]
+
+    try:
+        async def load_listing(request):
+            _, page_url = request
+            return await call_html_loader_async(html_loader, page_url)
+
+        stop_listing = False
+        for batch in request_batches(page_requests, chunks):
+            html_results = await asyncio.gather(
+                *(load_listing(request) for request in batch),
+                return_exceptions=True,
+            )
+            for (page_number, page_url), html in zip(batch, html_results):
+                if isinstance(html, BaseException):
+                    raise html
+
+                page_jobs = extract_jobs(
+                    html,
+                    base_url=page_url,
+                    limit=limit,
+                    full_time_only=full_time_only,
+                )
+                append_unique_jobs(jobs, seen_links, page_jobs, limit)
+
+                if len(jobs) >= limit or not page_jobs:
+                    stop_listing = True
+                    break
+
+            if stop_listing:
+                break
+
+        if not jobs:
+            raise ScraperError("JobHai page did not expose job cards")
+
+        if include_details:
+            async def load_detail(job):
+                detail = default_detail()
+                if job.get("link"):
+                    html = await call_html_loader_async(html_loader, job["link"])
+                    detail.update(extract_job_detail(html))
+                return detail
+
+            details = await run_in_batches(jobs, chunks, load_detail)
+            for job, detail in zip(jobs, details):
+                job.update(detail)
+    except (PlaywrightTimeoutError, AsyncPlaywrightTimeoutError) as exc:
+        raise ScraperError("Scraper timed out while loading JobHai") from exc
+    except (PlaywrightError, AsyncPlaywrightError) as exc:
+        raise ScraperError(str(exc)) from exc
 
     return jobs
 
@@ -389,51 +654,154 @@ def scrape_jobs_from_html_loader(
     include_details=True,
     full_time_only=True,
     max_pages=MAX_PAGES,
+    chunks=CHUNKS,
 ):
-    jobs = []
-    seen_links = set()
+    return run_async_entry(
+        scrape_jobs_from_html_loader_async,
+        url=url,
+        limit=limit,
+        html_loader=html_loader,
+        include_details=include_details,
+        full_time_only=full_time_only,
+        max_pages=max_pages,
+        chunks=chunks,
+    )
+
+
+async def scrape_jobs_async(
+    url=TARGET_URL,
+    limit=LIMIT,
+    html_loader=None,
+    include_details=True,
+    full_time_only=True,
+    storage_state=None,
+    headless=True,
+    browser_name=BROWSER,
+    max_pages=MAX_PAGES,
+    include_recruiter_contact=False,
+    decrypt_returned_contact_token=False,
+    chunks=CHUNKS,
+):
+    validate_chunks(chunks)
+    if html_loader:
+        return await scrape_jobs_from_html_loader_async(
+            url=url,
+            limit=limit,
+            html_loader=html_loader,
+            include_details=include_details,
+            full_time_only=full_time_only,
+            max_pages=max_pages,
+            chunks=chunks,
+        )
 
     try:
-        for page_number in range(1, max_pages + 1):
-            page_url = listing_page_url(url, page_number)
-            html = html_loader(page_url)
-            page_jobs = extract_jobs(
-                html,
-                base_url=page_url,
-                limit=limit,
-                full_time_only=full_time_only,
+        async with async_playwright() as playwright:
+            browser = await launch_browser_async(
+                playwright,
+                browser_name=browser_name,
+                headless=headless,
             )
+            # Keep page scraping public. JobHai serves a different logged-in
+            # listing shell that does not always expose the same job cards.
+            # The saved auth state is used later only for recruiter contact API
+            # calls, where authentication is actually required.
+            context = await browser.new_context(**browser_context_options())
 
-            for job in page_jobs:
-                key = job.get("link") or "|".join(
-                    [job.get("title", ""), job.get("company", "")]
-                )
-                if key in seen_links:
-                    continue
+            try:
+                jobs = []
+                seen_links = set()
+                page_requests = [
+                    (page_number, listing_page_url(url, page_number))
+                    for page_number in range(1, max_pages + 1)
+                ]
 
-                seen_links.add(key)
-                jobs.append(job)
-                if len(jobs) >= limit:
-                    break
+                async def load_listing(request):
+                    _, page_url = request
+                    return await load_page_html_async(
+                        context,
+                        playwright,
+                        page_url,
+                        browser_name=browser_name,
+                        headless=headless,
+                    )
 
-            if len(jobs) >= limit or not page_jobs:
-                break
-    except PlaywrightTimeoutError as exc:
+                stop_listing = False
+                for batch in request_batches(page_requests, chunks):
+                    html_results = await asyncio.gather(
+                        *(load_listing(request) for request in batch),
+                        return_exceptions=True,
+                    )
+                    for (page_number, page_url), html in zip(batch, html_results):
+                        if isinstance(html, AsyncPlaywrightError):
+                            if page_number == 1:
+                                raise html
+
+                            print(
+                                f"Warning: skipped listing page {page_number}: {html}",
+                                file=sys.stderr,
+                            )
+                            continue
+                        if isinstance(html, BaseException):
+                            raise html
+
+                        page_jobs = extract_jobs(
+                            html,
+                            base_url=page_url,
+                            limit=limit,
+                            full_time_only=full_time_only,
+                        )
+                        append_unique_jobs(jobs, seen_links, page_jobs, limit)
+
+                        if len(jobs) >= limit or not page_jobs:
+                            stop_listing = True
+                            break
+
+                    if stop_listing:
+                        break
+
+                if not jobs:
+                    raise ScraperError("JobHai page did not expose job cards")
+
+                if include_details:
+                    async def load_detail(job):
+                        detail = default_detail()
+                        if not job.get("link"):
+                            return detail
+
+                        try:
+                            html = await load_page_html_async(
+                                context,
+                                playwright,
+                                job["link"],
+                                browser_name=browser_name,
+                                headless=headless,
+                            )
+                            detail.update(extract_job_detail(html))
+                        except AsyncPlaywrightError:
+                            detail["jobDescription"] = " ".join(
+                                job.get("details", [])
+                            )
+                        return detail
+
+                    details = await run_in_batches(jobs, chunks, load_detail)
+                    for job, detail in zip(jobs, details):
+                        job.update(detail)
+
+                if include_recruiter_contact:
+                    await add_recruiter_contacts_async(
+                        jobs,
+                        storage_state,
+                        decrypt_returned_contact_token=decrypt_returned_contact_token,
+                        chunks=chunks,
+                    )
+
+                return jobs
+            finally:
+                await browser.close()
+    except AsyncPlaywrightTimeoutError as exc:
         raise ScraperError("Scraper timed out while loading JobHai") from exc
-    except PlaywrightError as exc:
+    except AsyncPlaywrightError as exc:
         raise ScraperError(str(exc)) from exc
-
-    if not jobs:
-        raise ScraperError("JobHai page did not expose job cards")
-
-    if include_details:
-        for job in jobs:
-            detail = default_detail()
-            if job.get("link"):
-                detail.update(extract_job_detail(html_loader(job["link"])))
-            job.update(detail)
-
-    return jobs
 
 
 def scrape_jobs(
@@ -448,120 +816,23 @@ def scrape_jobs(
     max_pages=MAX_PAGES,
     include_recruiter_contact=False,
     decrypt_returned_contact_token=False,
+    chunks=CHUNKS,
 ):
-    if html_loader:
-        return scrape_jobs_from_html_loader(
-            url=url,
-            limit=limit,
-            html_loader=html_loader,
-            include_details=include_details,
-            full_time_only=full_time_only,
-            max_pages=max_pages,
-        )
-
-    try:
-        with sync_playwright() as playwright:
-            browser = launch_browser(
-                playwright,
-                browser_name=browser_name,
-                headless=headless,
-            )
-            # Keep page scraping public. JobHai serves a different logged-in
-            # listing shell that does not always expose the same job cards.
-            # The saved auth state is used later only for recruiter contact API
-            # calls, where authentication is actually required.
-            context = browser.new_context(**browser_context_options())
-
-            try:
-                jobs = []
-                seen_links = set()
-                for page_number in range(1, max_pages + 1):
-                    page_url = listing_page_url(url, page_number)
-                    page = context.new_page()
-                    try:
-                        html = resilient_page_html(
-                            playwright,
-                            page,
-                            page_url,
-                            browser_name=browser_name,
-                            headless=headless,
-                        )
-                    except PlaywrightError as exc:
-                        if page_number == 1:
-                            raise
-
-                        print(
-                            f"Warning: skipped listing page {page_number}: {exc}",
-                            file=sys.stderr,
-                        )
-                        continue
-                    finally:
-                        page.close()
-
-                    page_jobs = extract_jobs(
-                        html,
-                        base_url=page_url,
-                        limit=limit,
-                        full_time_only=full_time_only,
-                    )
-
-                    for job in page_jobs:
-                        key = job.get("link") or "|".join(
-                            [job.get("title", ""), job.get("company", "")]
-                        )
-                        if key in seen_links:
-                            continue
-
-                        seen_links.add(key)
-                        jobs.append(job)
-                        if len(jobs) >= limit:
-                            break
-
-                    if len(jobs) >= limit or not page_jobs:
-                        break
-
-                if not jobs:
-                    raise ScraperError("JobHai page did not expose job cards")
-
-                if include_details:
-                    for job in jobs:
-                        detail = default_detail()
-                        if job.get("link"):
-                            detail_page = context.new_page()
-                            try:
-                                detail.update(
-                                    extract_job_detail(
-                                        resilient_page_html(
-                                            playwright,
-                                            detail_page,
-                                            job["link"],
-                                            browser_name=browser_name,
-                                            headless=headless,
-                                        )
-                                    )
-                                )
-                            except PlaywrightError:
-                                detail["jobDescription"] = " ".join(
-                                    job.get("details", [])
-                                )
-                            finally:
-                                detail_page.close()
-                        job.update(detail)
-
-                if include_recruiter_contact:
-                    add_recruiter_contacts(
-                        jobs,
-                        storage_state,
-                        decrypt_returned_contact_token=decrypt_returned_contact_token,
-                    )
-
-                return jobs
-            finally:
-                browser.close()
-    except PlaywrightTimeoutError as exc:
-        raise ScraperError("Scraper timed out while loading JobHai") from exc
-    except PlaywrightError as exc:
-        raise ScraperError(str(exc)) from exc
+    return run_async_entry(
+        scrape_jobs_async,
+        url=url,
+        limit=limit,
+        html_loader=html_loader,
+        include_details=include_details,
+        full_time_only=full_time_only,
+        storage_state=storage_state,
+        headless=headless,
+        browser_name=browser_name,
+        max_pages=max_pages,
+        include_recruiter_contact=include_recruiter_contact,
+        decrypt_returned_contact_token=decrypt_returned_contact_token,
+        chunks=chunks,
+    )
 
 
 def job_to_csv_row(job):
@@ -649,6 +920,12 @@ def main():
         type=int,
         default=MAX_PAGES,
         help="Maximum listing pages to scan",
+    )
+    arg_parser.add_argument(
+        "--chunks",
+        type=positive_int,
+        default=CHUNKS,
+        help="Concurrent requests per batch (default: %(default)s)",
     )
     arg_parser.add_argument(
         "--all-job-types",
@@ -752,6 +1029,7 @@ def main():
             max_pages=args.max_pages,
             include_recruiter_contact=args.include_recruiter_contact,
             decrypt_returned_contact_token=args.decrypt_contact_token,
+            chunks=args.chunks,
         )
     except ScraperError as exc:
         print(f"Error: {exc}", file=sys.stderr)
